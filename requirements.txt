@@ -1,0 +1,66 @@
+# 多模态医学影像分析项目依赖
+
+# 核心深度学习框架
+torch>=1.9.0
+torchvision>=0.10.0
+
+# 医学影像处理
+monai>=0.8.0
+SimpleITK>=2.1.0
+nibabel>=4.0.0
+pydicom>=2.2.0
+
+# 数值计算和科学计算
+numpy>=1.20.0
+scipy>=1.7.0
+pandas>=1.3.0
+
+# 机器学习工具
+scikit-learn>=1.0.0
+scikit-image>=0.18.0
+
+# 可视化
+matplotlib>=3.4.0
+seaborn>=0.11.0
+plotly>=5.3.0
+Pillow>=8.3.0
+
+# 进度条和日志
+tqdm>=4.62.0
+tensorboard>=2.6.0
+wandb>=0.12.0
+
+# 配置和文件操作
+pyyaml>=5.4.0
+tqdm>=4.62.0
+pathlib2>=2.3.0
+python-dotenv>=0.19.0
+
+# 数据增强
+opencv-python>=4.5.0
+
+# 生存分析
+lifelines>=0.26.0
+
+# Jupyter支持（可选）
+jupyter>=1.0.0
+ipykernel>=6.0.0
+ipywidgets>=7.6.0
+
+# 调试和测试
+pytest>=6.2.0
+pytest-cov>=3.0.0
+black>=21.0
+flake8>=3.9.0
+
+# 性能优化
+numba>=0.53.0
+cupy-cuda110>=9.0.0  # 如需GPU加速（指定CUDA版本）
+
+# 实验追踪（可选）
+mlflow>=1.20.0
+hydra-core>=1.1.0
+
+# 开发依赖
+setuptools>=57.0.0
+wheel>=0.37.0
