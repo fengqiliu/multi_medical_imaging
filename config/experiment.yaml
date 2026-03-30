@@ -1,0 +1,56 @@
+﻿data:
+  dataset_name: brats2021
+  data_dir: ./data/BraTS2021
+  modalities:
+    - t1
+    - t2
+    - flair
+    - t1ce
+  target_size:
+    - 128
+    - 128
+    - 128
+  target_spacing:
+    - 1.0
+    - 1.0
+    - 1.0
+  train_split: 0.7
+  val_split: 0.15
+  num_workers: 4
+
+model:
+  architecture: unet3d
+  in_channels: 4
+  out_channels: 4
+  base_filters: 32
+  encoder_name: resnet34
+  pretrained: true
+  fusion_method: attention
+  use_deep_supervision: true
+  dropout_rate: 0.1
+
+training:
+  epochs: 200
+  batch_size: 2
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 10
+  gradient_clip: 1.0
+  mixed_precision: true
+  accumulation_steps: 4
+  dice_weight: 0.5
+  focal_weight: 0.5
+
+experiment:
+  experiment_name: multimodal_segmentation
+  seed: 42
+  device: cuda
+  log_interval: 10
+  save_interval: 5
+  val_interval: 1
+  checkpoint_dir: ./checkpoints
+  log_dir: ./logs
+  use_tensorboard: true
+  resume_checkpoint: null
