@@ -7,15 +7,21 @@ from .base_config import (
     ModelConfig,
     TrainingConfig,
     ExperimentConfig,
+    SurvivalConfig,
     load_config,
-    save_config
+    save_config,
+    create_config_from_dict,
+    print_config
 )
 
 __all__ = [
     "DataConfig",
-    "ModelConfig", 
+    "ModelConfig",
     "TrainingConfig",
     "ExperimentConfig",
+    "SurvivalConfig",
     "load_config",
-    "save_config"
+    "save_config",
+    "create_config_from_dict",
+    "print_config"
 ]

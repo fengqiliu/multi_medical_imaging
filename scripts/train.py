@@ -149,7 +149,7 @@ def create_model(config: ModelConfig):
         base_filters=config.base_filters,
         dropout=config.dropout_rate,
         fusion_method=config.fusion_method,
-        num_modalities=len(config.in_channels) if isinstance(config.in_channels, int) else 4
+        num_modalities=config.in_channels if isinstance(config.in_channels, int) else len(config.in_channels)
     )
     
     return model
@@ -187,6 +187,7 @@ def train(args):
         experiment_config = ExperimentConfig(
             experiment_name=args.experiment_name,
             seed=args.seed,
+            device=args.device,
             checkpoint_dir=args.checkpoint_dir,
             log_dir=args.log_dir
         )
@@ -195,7 +196,11 @@ def train(args):
     print_config(data_config, model_config, training_config, experiment_config)
     
     # 设置设备
-    device = torch.device(experiment_config.device if torch.cuda.is_available() else "cpu")
+    requested_device = experiment_config.device
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        print(f"请求设备 {requested_device} 不可用，回退到 CPU")
+        requested_device = "cpu"
+    device = torch.device(requested_device)
     print(f"\n使用设备: {device}")
     
     # 创建数据模块
@@ -206,20 +211,23 @@ def train(args):
         num_workers=data_config.num_workers,
         modalities=data_config.modalities,
         crop_size=data_config.target_size,
-        target_spacing=data_config.target_spacing
+        target_spacing=data_config.target_spacing,
+        train_split=data_config.train_split,
+        val_split=data_config.val_split,
+        seed=experiment_config.seed,
+        preload=data_config.preload_data,
     )
-    
-    try:
-        data_module.setup()
-        train_loader = data_module.train_dataloader()
-        val_loader = data_module.val_dataloader()
-        print(f"训练集: {len(train_loader.dataset)} 样本")
-        print(f"验证集: {len(val_loader.dataset)} 样本")
-    except Exception as e:
-        print(f"数据加载失败: {e}")
-        print("将使用合成数据进行演示...")
-        train_loader = None
-        val_loader = None
+
+    data_module.setup()
+    train_loader = data_module.train_dataloader()
+    val_loader = data_module.val_dataloader()
+    test_loader = data_module.test_dataloader()
+    data_module.save_split_manifest(
+        str(Path(experiment_config.log_dir) / "split_case_ids.json")
+    )
+    print(f"训练集: {len(train_loader.dataset)} 样本")
+    print(f"验证集: {len(val_loader.dataset)} 样本")
+    print(f"测试集: {len(test_loader.dataset)} 样本")
     
     # 创建模型
     print("\n创建模型...")
@@ -269,16 +277,20 @@ def train(args):
         trainer.load_checkpoint(experiment_config.resume_checkpoint)
     
     # 开始训练
-    if train_loader and val_loader:
-        print("\n开始训练...")
-        trainer.fit(
-            train_loader=train_loader,
-            val_loader=val_loader,
-            epochs=training_config.epochs,
-            start_epoch=trainer.current_epoch
-        )
-    else:
-        print("\n跳过训练（无有效数据）")
+    print("\n开始训练...")
+    trainer.fit(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        epochs=training_config.epochs,
+        start_epoch=trainer.current_epoch
+    )
+
+    print("\n在独立测试集上评估...")
+    test_metrics = trainer.evaluate(test_loader)
+    trainer.history["test"] = [test_metrics]
+    print("测试集结果: " + " | ".join(
+        f"{key}: {value:.4f}" for key, value in test_metrics.items()
+    ))
     
     # 保存训练历史
     trainer.save_history()

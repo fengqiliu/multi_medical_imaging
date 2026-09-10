@@ -68,6 +68,9 @@ multimodal_medical_imaging/
 
 ## 快速开始
 
+纯分割 CPU 开发与小张量回归测试请先使用 [BASELINE.md](BASELINE.md) 中的独立核心依赖基线。
+以下完整研究依赖和真实数据训练流程尚未全部验证。
+
 ### 安装依赖
 
 ```bash

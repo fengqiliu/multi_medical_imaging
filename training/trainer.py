@@ -68,8 +68,9 @@ class BaseTrainer:
         # 训练状态
         self.current_epoch = 0
         self.global_step = 0
-        self.best_metric = 0.0
+        self.best_metric = float("inf")
         self.history = {"train": [], "val": []}
+        self.total_epochs = 0
     
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
         """
@@ -82,8 +83,11 @@ class BaseTrainer:
             训练指标字典
         """
         self.model.train()
-        epoch_losses = {}
-        total_batches = len(train_loader)
+        if len(train_loader) == 0:
+            raise ValueError("训练 DataLoader 为空")
+
+        epoch_losses = []
+        metric_values = {}
         
         pbar = tqdm(train_loader, desc=f"Epoch {self.current_epoch}")
         
@@ -118,19 +122,27 @@ class BaseTrainer:
             
             self.optimizer.step()
             
+            loss_value = float(loss.detach().cpu().item())
+            epoch_losses.append(loss_value)
+            if isinstance(outputs, dict):
+                for key, value in outputs.items():
+                    if key != "loss" and isinstance(value, torch.Tensor) and value.ndim == 0:
+                        metric_values.setdefault(key, []).append(float(value.detach().cpu().item()))
+
             # 更新进度条
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            pbar.set_postfix({"loss": f"{loss_value:.4f}"})
             
             # 记录到TensorBoard
             if self.global_step % 10 == 0:
-                self.writer.add_scalar("train/loss", loss.item(), self.global_step)
+                self.writer.add_scalar("train/loss", loss_value, self.global_step)
             
             self.global_step += 1
         
-        # 计算epoch平均损失
-        return {"loss": loss.item()}
+        metrics = {"loss": float(np.mean(epoch_losses))}
+        metrics.update({key: float(np.mean(values)) for key, values in metric_values.items()})
+        return metrics
     
-    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
+    def validate(self, val_loader: DataLoader, stage: str = "val") -> Dict[str, float]:
         """
         验证模型
         
@@ -141,8 +153,15 @@ class BaseTrainer:
             验证指标字典
         """
         self.model.eval()
+        if len(val_loader) == 0:
+            raise ValueError("验证 DataLoader 为空")
+
         total_loss = 0.0
-        total_batches = len(val_loader)
+        total_batches = 0
+
+        metrics_fn = getattr(self, "metrics_fn", None)
+        if metrics_fn is not None and hasattr(metrics_fn, "reset"):
+            metrics_fn.reset()
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation"):
@@ -157,13 +176,23 @@ class BaseTrainer:
                     loss = outputs
                 
                 total_loss += loss.item()
+                total_batches += 1
         
         avg_loss = total_loss / total_batches
         
         # 记录到TensorBoard
-        self.writer.add_scalar("val/loss", avg_loss, self.current_epoch)
+        self.writer.add_scalar(f"{stage}/loss", avg_loss, self.current_epoch)
         
-        return {"val_loss": avg_loss}
+        metrics = {"val_loss": avg_loss}
+        if metrics_fn is not None and hasattr(metrics_fn, "compute"):
+            metrics.update(metrics_fn.compute())
+        return metrics
+
+    def evaluate(self, test_loader: DataLoader) -> Dict[str, float]:
+        """在模型选择完成后对独立测试集做一次只读评估。"""
+        metrics = self.validate(test_loader, stage="test")
+        metrics["test_loss"] = metrics.pop("val_loss")
+        return metrics
     
     def training_step(self, batch: Dict) -> Dict[str, torch.Tensor]:
         """
@@ -224,6 +253,7 @@ class BaseTrainer:
         print(f"日志保存到: {self.log_dir}")
         print(f"检查点保存到: {self.checkpoint_dir}")
         
+        self.total_epochs = epochs
         for epoch in range(start_epoch, epochs):
             self.current_epoch = epoch
             
@@ -241,7 +271,10 @@ class BaseTrainer:
             
             # 学习率调度
             if self.scheduler is not None:
-                self.scheduler.step()
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(metrics.get("val_loss", train_metrics["loss"]))
+                else:
+                    self.scheduler.step()
                 current_lr = self.optimizer.param_groups[0]['lr']
                 self.writer.add_scalar("train/learning_rate", current_lr, epoch)
             
@@ -273,7 +306,7 @@ class BaseTrainer:
             metrics: 指标字典
         """
         metrics_str = " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
-        print(f"Epoch {epoch+1}/{self.history['train'].__len__() + epoch} - {metrics_str}")
+        print(f"Epoch {epoch + 1}/{self.total_epochs} - {metrics_str}")
     
     def save_checkpoint(
         self,
@@ -329,7 +362,7 @@ class BaseTrainer:
         
         self.current_epoch = checkpoint["epoch"] + 1
         self.global_step = checkpoint["global_step"]
-        self.best_metric = checkpoint.get("best_metric", 0.0)
+        self.best_metric = checkpoint.get("best_metric", float("inf"))
         self.history = checkpoint.get("history", {"train": [], "val": []})
         
         print(f"检查点已加载: {checkpoint_path}")
@@ -346,16 +379,14 @@ class BaseTrainer:
         
         # 转换numpy数组为列表
         history_serializable = {
-            "train": [
-                {k: float(v) if isinstance(v, (np.floating, np.integer)) else v 
-                 for k, v in epoch_metrics.items()}
-                for epoch_metrics in self.history["train"]
-            ],
-            "val": [
-                {k: float(v) if isinstance(v, (np.floating, np.integer)) else v 
-                 for k, v in epoch_metrics.items()}
-                for epoch_metrics in self.history["val"]
+            split: [
+                {
+                    key: float(value) if isinstance(value, (np.floating, np.integer)) else value
+                    for key, value in epoch_metrics.items()
+                }
+                for epoch_metrics in metrics
             ]
+            for split, metrics in self.history.items()
         }
         
         with open(history_path, 'w') as f:
@@ -473,9 +504,15 @@ class SegmentationTrainer(BaseTrainer):
             
             loss = self.loss_fn(main_output, labels)["total"]
             
-            # 计算指标
+            # 累积验证指标，由BaseTrainer.validate统一计算
             preds = torch.argmax(main_output, dim=1)
-            metrics = self.metrics_fn(preds, labels)
+            if self.metrics_fn is not None and hasattr(self.metrics_fn, "update"):
+                self.metrics_fn.update(preds, labels)
+                metrics = {}
+            elif self.metrics_fn is not None:
+                metrics = self.metrics_fn(preds, labels)
+            else:
+                metrics = {}
         
         return {"loss": loss, **metrics}
 

@@ -11,7 +11,7 @@ from .losses import (
     MultiTaskLoss
 )
 
-from .trainer import BaseTrainer
+from .trainer import BaseTrainer, SegmentationTrainer
 
 __all__ = [
     "DiceLoss",
@@ -20,5 +20,6 @@ __all__ = [
     "DeepSurvivalLoss",
     "SurvivalCIndexLoss",
     "MultiTaskLoss",
-    "BaseTrainer"
+    "BaseTrainer",
+    "SegmentationTrainer"
 ]

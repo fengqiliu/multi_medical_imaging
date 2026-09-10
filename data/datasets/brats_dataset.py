@@ -6,6 +6,8 @@ BraTS多模态脑肿瘤分割数据集
 """
 
 import os
+import random
+import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -49,7 +51,9 @@ class MultiModalBrATS(Dataset):
         transform=None,
         target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
         crop_size: Tuple[int, int, int] = (128, 128, 128),
-        preload: bool = False
+        preload: bool = False,
+        case_ids: Optional[List[str]] = None,
+        require_label: bool = True,
     ):
         """
         初始化BraTS数据集
@@ -70,12 +74,10 @@ class MultiModalBrATS(Dataset):
         self.target_spacing = target_spacing
         self.crop_size = crop_size
         self.preload = preload
+        self.require_label = require_label
         
         # 扫描数据目录
-        self.case_ids = self._scan_cases()
-        
-        # 预处理变换
-        self.preprocessing = self._get_preprocessing_transforms()
+        self.case_ids = list(case_ids) if case_ids is not None else self._scan_cases()
         
         # 预加载数据（可选）
         if self.preload:
@@ -96,9 +98,35 @@ class MultiModalBrATS(Dataset):
         
         return case_ids
     
-    def _load_nifti(self, file_path: str) -> Tuple[np.ndarray, dict]:
-        """加载NIfTI文件"""
+    def _load_nifti(
+        self,
+        file_path: str,
+        is_label: bool = False,
+    ) -> Tuple[np.ndarray, dict]:
+        """加载、统一方向和体素间距后的NIfTI数组。"""
         image = sitk.ReadImage(file_path)
+        image = sitk.DICOMOrient(image, "RAS")
+        original_spacing = image.GetSpacing()
+        original_size = image.GetSize()
+
+        if tuple(original_spacing) != tuple(self.target_spacing):
+            output_size = [
+                max(1, int(round(size * spacing / target)))
+                for size, spacing, target in zip(
+                    original_size, original_spacing, self.target_spacing
+                )
+            ]
+            resampler = sitk.ResampleImageFilter()
+            resampler.SetOutputSpacing(tuple(self.target_spacing))
+            resampler.SetSize(output_size)
+            resampler.SetOutputDirection(image.GetDirection())
+            resampler.SetOutputOrigin(image.GetOrigin())
+            resampler.SetTransform(sitk.Transform())
+            resampler.SetInterpolator(
+                sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear
+            )
+            image = resampler.Execute(image)
+
         array = sitk.GetArrayFromImage(image)
         spacing = image.GetSpacing()
         origin = image.GetOrigin()
@@ -120,34 +148,20 @@ class MultiModalBrATS(Dataset):
         for mod in self.modalities:
             file_path = os.path.join(case_dir, f"{case_id}_{mod}.nii.gz")
             if os.path.exists(file_path):
-                data[mod], _ = self._load_nifti(file_path)
+                data[mod], _ = self._load_nifti(file_path, is_label=False)
             else:
                 raise FileNotFoundError(f"模态文件不存在: {file_path}")
         
         # 加载标签
         seg_path = os.path.join(case_dir, f"{case_id}_seg.nii.gz")
         if os.path.exists(seg_path):
-            data["label"], _ = self._load_nifti(seg_path)
+            data["label"], _ = self._load_nifti(seg_path, is_label=True)
+        elif self.require_label:
+            raise FileNotFoundError(f"分割标签不存在: {seg_path}")
         else:
             data["label"] = None
         
         return data
-    
-    def _get_preprocessing_transforms(self):
-        """获取预处理变换"""
-        return mtransforms.Compose([
-            mtransforms.LoadImageD(keys=self.modalities + ["label"]),
-            mtransforms.AddChannelD(keys=self.modalities),
-            mtransforms.SpacingD(
-                keys=self.modalities + ["label"],
-                pixdim=self.target_spacing,
-                mode=("bilinear", "nearest")
-            ),
-            mtransforms.Orientationd(
-                keys=self.modalities + ["label"],
-                axcodes="RAS"
-            ),
-        ])
     
     def _normalize_intensity(
         self, 
@@ -192,6 +206,10 @@ class MultiModalBrATS(Dataset):
             调整后的体数据
         """
         current_shape = volume.shape
+        if len(current_shape) != len(target_size):
+            raise ValueError(
+                f"体数据维度 {current_shape} 与目标维度 {target_size} 不一致"
+            )
         
         # 计算裁剪起点
         starts = [(c - t) // 2 for c, t in zip(current_shape, target_size)]
@@ -201,18 +219,17 @@ class MultiModalBrATS(Dataset):
         ends = [s + t for s, t in zip(starts, target_size)]
         ends = [min(e, c) for e, c in zip(ends, current_shape)]
         
-        cropped = volume[
-            starts[0]:ends[0],
-            starts[1]:ends[1],
-            starts[2]:ends[2]
-        ]
+        cropped = volume[tuple(slice(start, end) for start, end in zip(starts, ends))]
         
         # 填充（如需要）
         if cropped.shape != tuple(target_size):
             padded = np.zeros(target_size, dtype=volume.dtype)
             p_starts = [(t - c) // 2 for c, t in zip(cropped.shape, target_size)]
             p_ends = [p + c for p, c in zip(p_starts, cropped.shape)]
-            padded[p_starts[0]:p_ends[0], p_starts[1]:p_ends[1], p_starts[2]:p_ends[2]] = cropped
+            destination = tuple(
+                slice(start, end) for start, end in zip(p_starts, p_ends)
+            )
+            padded[destination] = cropped
             return padded
         
         return cropped
@@ -247,6 +264,14 @@ class MultiModalBrATS(Dataset):
         # 处理标签
         if data["label"] is not None:
             label = data["label"].astype(np.int64)
+            unique_labels = set(np.unique(label).tolist())
+            unexpected_labels = unique_labels.difference({0, 1, 2, 4})
+            if unexpected_labels:
+                raise ValueError(
+                    f"{case_id} 标签包含未支持的值: {sorted(unexpected_labels)}"
+                )
+            # BraTS 原始标签为 0/1/2/4，四分类损失需要连续索引 0/1/2/3。
+            label = np.where(label == 4, 3, label).astype(np.int64)
         else:
             label = np.zeros_like(images[0], dtype=np.int64)
         
@@ -256,17 +281,13 @@ class MultiModalBrATS(Dataset):
         
         # 应用增强变换
         if self.transform:
-            # MONAI期望通道在最后
-            images = np.moveaxis(images, 0, -1)
-            label = np.moveaxis(label, 0, -1)
-            
+            # MONAI 字典变换使用通道优先；标签补一个通道后再移除。
             transformed = self.transform({
                 "image": images,
-                "label": label
+                "label": label[None, ...],
             })
-            
-            images = np.moveaxis(transformed["image"], -1, 0)
-            label = np.moveaxis(transformed["label"], -1, 0)
+            images = np.asarray(transformed["image"])
+            label = np.asarray(transformed["label"])[0]
         
         # 转换为张量
         images = torch.from_numpy(images).float()
@@ -293,7 +314,11 @@ class BrATSDataModule:
         num_workers: int = 4,
         modalities: List[str] = ["t1", "t2", "flair", "t1ce"],
         crop_size: Tuple[int, int, int] = (128, 128, 128),
-        target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+        target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        train_split: float = 0.7,
+        val_split: float = 0.15,
+        seed: int = 42,
+        preload: bool = False,
     ):
         """
         初始化数据模块
@@ -312,6 +337,10 @@ class BrATSDataModule:
         self.modalities = modalities
         self.crop_size = crop_size
         self.target_spacing = target_spacing
+        self.train_split = train_split
+        self.val_split = val_split
+        self.seed = seed
+        self.preload = preload
         
         self.train_transform = self._get_train_transform()
         self.val_transform = self._get_val_transform()
@@ -319,47 +348,37 @@ class BrATSDataModule:
     def _get_train_transform(self):
         """训练数据增强"""
         return mtransforms.Compose([
-            mtransforms.RandRotated(
+            mtransforms.RandRotateD(
                 keys=["image", "label"],
-                range_x=15,
-                range_y=15,
-                range_z=15,
+                range_x=np.deg2rad(15),
+                range_y=np.deg2rad(15),
+                range_z=np.deg2rad(15),
                 prob=0.5,
                 mode=("bilinear", "nearest")
             ),
-            mtransforms.RandFlipd(
+            mtransforms.RandFlipD(
                 keys=["image", "label"],
                 spatial_axis=[0, 1, 2],
                 prob=0.5
             ),
-            mtransforms.RandGaussianNoised(
+            mtransforms.RandGaussianNoiseD(
                 keys=["image"],
                 prob=0.3,
                 mean=0.0,
                 std=0.1
             ),
-            mtransforms.RandAdjustContrastd(
+            mtransforms.RandAdjustContrastD(
                 keys=["image"],
                 prob=0.3,
                 gamma=(0.7, 1.5)
             ),
-            mtransforms.RandZoomd(
+            mtransforms.RandZoomD(
                 keys=["image", "label"],
                 prob=0.2,
                 min_zoom=0.8,
                 max_zoom=1.2,
                 mode=("trilinear", "nearest")
             ),
-            mtransforms.RandGibbsNoised(
-                keys=["image"],
-                prob=0.2,
-                alpha=(0.5, 1.0)
-            ),
-            mtransforms.RandKSpaceSpikeNoised(
-                keys=["image"],
-                prob=0.1,
-                intensity_range=(0.5, 1.5)
-            )
         ])
     
     def _get_val_transform(self):
@@ -373,30 +392,54 @@ class BrATSDataModule:
         Args:
             stage: 当前阶段 ('fit', 'validate', 'test', 或 None)
         """
-        # 划分数据集
-        full_dataset = MultiModalBrATS(
+        # 先按病例ID拆分，再为每个子集创建独立Dataset，避免共享transform。
+        discovery_dataset = MultiModalBrATS(
             data_dir=self.data_dir,
             split="full",
             modalities=self.modalities,
             target_spacing=self.target_spacing,
-            crop_size=self.crop_size
+            crop_size=self.crop_size,
+            require_label=True,
         )
-        
-        total_size = len(full_dataset)
-        train_size = int(0.7 * total_size)
-        val_size = int(0.15 * total_size)
+        case_ids = list(discovery_dataset.case_ids)
+        total_size = len(case_ids)
+        if total_size < 4:
+            raise ValueError("训练/验证/测试三份拆分至少需要4个带标签病例")
+
+        rng = random.Random(self.seed)
+        rng.shuffle(case_ids)
+        train_size = max(1, int(self.train_split * total_size))
+        val_size = max(1, int(self.val_split * total_size))
+        if train_size + val_size >= total_size:
+            val_size = max(1, total_size - train_size - 1)
         test_size = total_size - train_size - val_size
-        
-        self.train_dataset, self.val_dataset, self.test_dataset = torch.utils.data.random_split(
-            full_dataset,
-            [train_size, val_size, test_size],
-            generator=torch.Generator().manual_seed(42)
+
+        train_ids = case_ids[:train_size]
+        val_ids = case_ids[train_size:train_size + val_size]
+        test_ids = case_ids[train_size + val_size:]
+        self.split_case_ids = {
+            "train": train_ids,
+            "val": val_ids,
+            "test": test_ids,
+        }
+
+        common = dict(
+            data_dir=self.data_dir,
+            modalities=self.modalities,
+            target_spacing=self.target_spacing,
+            crop_size=self.crop_size,
+            preload=self.preload,
+            require_label=True,
         )
-        
-        # 设置变换
-        self.train_dataset.dataset.transform = self.train_transform
-        self.val_dataset.dataset.transform = self.val_transform
-        self.test_dataset.dataset.transform = self.val_transform
+        self.train_dataset = MultiModalBrATS(
+            transform=self.train_transform, case_ids=train_ids, **common
+        )
+        self.val_dataset = MultiModalBrATS(
+            transform=self.val_transform, case_ids=val_ids, **common
+        )
+        self.test_dataset = MultiModalBrATS(
+            transform=self.val_transform, case_ids=test_ids, **common
+        )
     
     def train_dataloader(self):
         """训练数据加载器"""
@@ -408,6 +451,17 @@ class BrATSDataModule:
             pin_memory=True,
             persistent_workers=True if self.num_workers > 0 else False
         )
+
+    def save_split_manifest(self, path: str):
+        """保存病例级拆分清单，便于复现实验和审计患者边界。"""
+        if not hasattr(self, "split_case_ids"):
+            raise RuntimeError("请先调用 setup() 创建数据拆分")
+        manifest_path = os.fspath(path)
+        parent = os.path.dirname(manifest_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(manifest_path, "w", encoding="utf-8") as file:
+            json.dump(self.split_case_ids, file, ensure_ascii=False, indent=2)
     
     def val_dataloader(self):
         """验证数据加载器"""

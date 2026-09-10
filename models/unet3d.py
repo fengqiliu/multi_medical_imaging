@@ -277,25 +277,27 @@ class AttentionUNet3D(nn.Module):
         
         # 解码器（带注意力门控）
         self.dec4 = DecoderBlock3D(
-            base_filters * 32, base_filters * 8, base_filters * 8, dropout, use_attention=True
+            base_filters * 32, base_filters * 16, base_filters * 16, dropout, use_attention=True
         )
         self.dec3 = DecoderBlock3D(
-            base_filters * 8, base_filters * 4, base_filters * 4, dropout, use_attention=True
+            base_filters * 16, base_filters * 8, base_filters * 8, dropout, use_attention=True
         )
         self.dec2 = DecoderBlock3D(
-            base_filters * 4, base_filters * 2, base_filters * 2, dropout, use_attention=True
+            base_filters * 8, base_filters * 4, base_filters * 4, dropout, use_attention=True
         )
         self.dec1 = DecoderBlock3D(
-            base_filters * 2, base_filters, base_filters, dropout, use_attention=False
+            base_filters * 4, base_filters * 2, base_filters * 2, dropout, use_attention=False
         )
         
         # 最终输出
-        self.out_conv = nn.Conv3d(base_filters, out_channels, kernel_size=1)
+        self.out_conv = nn.Conv3d(base_filters * 2, out_channels, kernel_size=1)
         
         # 深度监督的辅助头
         self.aux_heads = nn.ModuleList([
-            nn.Conv3d(base_filters * (2 ** i), out_channels, 1)
-            for i in range(4)
+            nn.Conv3d(base_filters * 16, out_channels, 1),
+            nn.Conv3d(base_filters * 8, out_channels, 1),
+            nn.Conv3d(base_filters * 4, out_channels, 1),
+            nn.Conv3d(base_filters * 2, out_channels, 1),
         ])
     
     def forward(
@@ -316,32 +318,40 @@ class AttentionUNet3D(nn.Module):
         # 编码路径
         x0 = self.init_conv(x)      # (B, 32, H, W, D)
         
-        s1, x1 = self.enc1(x0)       # s1: (B, 64, H/2, W/2, D/2)
-        s2, x2 = self.enc2(x1)       # s2: (B, 128, H/4, W/4, D/4)
-        s3, x3 = self.enc3(x2)       # s3: (B, 256, H/8, W/8, D/8)
-        s4, x4 = self.enc4(x3)       # s4: (B, 512, H/16, W/16, D/16)
+        s1, x1 = self.enc1(x0)       # skip before pooling: full resolution
+        s2, x2 = self.enc2(x1)       # skip at half resolution
+        s3, x3 = self.enc3(x2)       # skip at quarter resolution
+        s4, x4 = self.enc4(x3)       # skip at one-eighth resolution
         
         # 瓶颈
-        x = self.bottleneck(x4)      # (B, 1024, H/16, W/16, D/16)
+        bottleneck = self.bottleneck(x4)  # (B, 1024, H/16, W/16, D/16)
         
         # 解码路径
-        x = self.dec4(x, s4)          # (B, 256, H/8, W/8, D/8)
-        x = self.dec3(x, s3)          # (B, 128, H/4, W/4, D/4)
-        x = self.dec2(x, s2)          # (B, 64, H/2, W/2, D/2)
-        x = self.dec1(x, s1)          # (B, 32, H, W, D)
+        d4 = self.dec4(bottleneck, s4)  # (B, 512, H/8, W/8, D/8)
+        d3 = self.dec3(d4, s3)          # (B, 256, H/4, W/4, D/4)
+        d2 = self.dec2(d3, s2)          # (B, 128, H/2, W/2, D/2)
+        d1 = self.dec1(d2, s1)          # (B, 64, H, W, D)
         
         # 主输出
-        outputs["main"] = self.out_conv(x)
+        outputs["main"] = self.out_conv(d1)
         
         # 辅助输出（深度监督）
+        output_size = outputs["main"].shape[2:]
         outputs["aux"] = [
-            aux(x) for aux in self.aux_heads
+            F.interpolate(
+                aux_head(feature),
+                size=output_size,
+                mode="trilinear",
+                align_corners=False,
+            )
+            for aux_head, feature in zip(self.aux_heads, (d4, d3, d2, d1))
         ]
         
         if return_features:
             outputs["features"] = {
                 "enc1": s1, "enc2": s2, "enc3": s3, "enc4": s4,
-                "dec4": x, "bottleneck": x4
+                "dec4": d4, "dec3": d3, "dec2": d2, "dec1": d1,
+                "bottleneck": bottleneck,
             }
         
         return outputs

@@ -2,7 +2,7 @@
 数据处理模块初始化
 """
 
-from .brats_dataset import MultiModalBrATS, BrATSDataModule
+from .datasets.brats_dataset import MultiModalBrATS, BrATSDataModule
 from .preprocessing import ImagePreprocessor
 from .augmentation import MedicalImageAugmentation
 
